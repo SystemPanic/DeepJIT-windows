@@ -18,6 +18,14 @@ namespace deep_jit {
 
 inline constexpr std::string_view kCommitFileName = ".committed";
 
+// Separator for JIT_CACHE_DIR path lists. Windows paths contain ':' after the
+// drive letter (e.g. "C:\cache"), so use ';' there, matching PATH conventions.
+#ifdef _WIN32
+inline constexpr char kPathListSeparator = ';';
+#else
+inline constexpr char kPathListSeparator = ':';
+#endif
+
 // One disk-cache slot. On a miss the entry points at a private temporary
 // directory; commit() publishes it atomically (whole-directory rename) after
 // fsync, so concurrent processes on (distributed) filesystems observe either
@@ -84,14 +92,35 @@ struct DiskCache {
         DJ_HOST_ASSERT(not this->paths.empty());
     }
 
+    // Default writable cache root: `<home>/.dj`.
+    // HOME is normally unset on Windows, so fall back to USERPROFILE / LOCALAPPDATA.
+    static std::filesystem::path default_root() {
+#ifdef _WIN32
+        constexpr const char* kHomeVars[] = {"HOME", "USERPROFILE", "LOCALAPPDATA"};
+#else
+        constexpr const char* kHomeVars[] = {"HOME"};
+#endif
+        for (const char* name: kHomeVars) {
+            const auto value = get_env<std::string>(name);
+            if (not value.empty())
+                return std::filesystem::path(value) / ".dj";
+        }
+#ifdef _WIN32
+        DJ_HOST_ASSERT(false, "none of HOME, USERPROFILE, LOCALAPPDATA is set; set JIT_CACHE_DIR to choose a cache directory");
+#else
+        DJ_HOST_ASSERT(false, "HOME environment variable must not be empty; set JIT_CACHE_DIR to choose a cache directory");
+#endif
+        return {};
+    }
+
     static DiskCache from_env(const Env& env) {
-        // Parse PATH_1:PATH_2:PATH_3 into a writable cache root followed by
-        // zero or more read-only lookup roots.
+        // Parse a path list (':'-separated on POSIX, ';'-separated on Windows) into
+        // a writable cache root followed by zero or more read-only lookup roots.
         std::vector<std::filesystem::path> paths;
         if (const auto env_opt = env.get<std::string>("JIT_CACHE_DIR")) {
             size_t begin = 0;
             while (true) {
-                const auto end = env_opt->find(':', begin);
+                const auto end = env_opt->find(kPathListSeparator, begin);
                 const auto item = env_opt->substr(begin, end - begin);
                 DJ_HOST_ASSERT(not item.empty(), "disk cache path list contains an empty path: {}", env_opt.value());
                 paths.emplace_back(item);
@@ -100,9 +129,7 @@ struct DiskCache {
                 begin = end + 1;
             }
         } else {
-            const auto home = get_env<std::string>("HOME");
-            DJ_HOST_ASSERT(not home.empty(), "HOME environment variable must not be empty");
-            paths.emplace_back(std::filesystem::path(home) / ".dj");
+            paths.emplace_back(default_root());
         }
 
         return DiskCache(paths);
