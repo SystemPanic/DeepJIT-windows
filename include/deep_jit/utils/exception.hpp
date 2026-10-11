@@ -1,22 +1,73 @@
 #pragma once
 
-#include <elfutils/libdwfl.h>
-
 #include <array>
 #include <cstdint>
 #include <cstdlib>
-#include <cxxabi.h>
-#include <dlfcn.h>
 #include <exception>
-#include <execinfo.h>
 #include <format>
 #include <string>
 #include <string_view>
-#include <unistd.h>
+#include <version>
+
+#if defined(_WIN32)
+    #define DJ_NOINLINE __declspec(noinline)
+    #if defined(__cpp_lib_stacktrace)
+        #include <stacktrace>
+    #endif
+#else
+    #define DJ_NOINLINE __attribute__((noinline))
+    #include <elfutils/libdwfl.h>
+    #include <cxxabi.h>
+    #include <dlfcn.h>
+    #include <execinfo.h>
+    #include <unistd.h>
+#endif
 
 namespace deep_jit::exception {
 
 namespace detail {
+
+#if defined(_WIN32)
+
+// Windows: frame descriptions look like "module!function+0x1a"
+inline bool is_python_frame(std::string_view description) {
+    const auto bang = description.find('!');
+    const std::string_view module = description.substr(0, bang);
+    if (module.starts_with("python") or module.starts_with("Python"))
+        return true;
+    if (bang != std::string_view::npos) {
+        const std::string_view symbol = description.substr(bang + 1);
+        if (symbol.starts_with("Py") or symbol.starts_with("_Py"))
+            return true;
+    }
+    return false;
+}
+
+template <std::size_t num_frames_to_skip = 0>
+inline DJ_NOINLINE std::string get_backtrace() {
+#if defined(__cpp_lib_stacktrace)
+    constexpr std::size_t max_num_frames = 16;
+    const auto trace = std::stacktrace::current(num_frames_to_skip, max_num_frames);
+    std::string result;
+    std::size_t i = 0;
+    for (const auto& entry : trace) {
+        const std::string description = entry.description();
+        if (is_python_frame(description))
+            break;
+        const std::string file = entry.source_file();
+        result += std::format("  #{} {} at {}:{}\n",
+                              i++,
+                              description.empty() ? "<unknown function>" : description,
+                              file.empty() ? "??" : file,
+                              entry.source_line());
+    }
+    return result;
+#else
+    return {};
+#endif
+}
+
+#else // POSIX / Linux
 
 struct DwflApi {
     struct FrameInfo {
@@ -122,7 +173,7 @@ inline std::string demangle(const char* name) {
 }
 
 template <std::size_t num_frames_to_skip = 0>
-inline __attribute__((noinline)) std::string get_backtrace() {
+inline DJ_NOINLINE std::string get_backtrace() {
     static DwflApi api;
     api.refresh();
 
@@ -154,16 +205,18 @@ inline __attribute__((noinline)) std::string get_backtrace() {
     return result;
 }
 
+#endif // _WIN32
+
 } // namespace detail
 
 class Exception final : public std::exception {
 public:
     std::string message = {};
 
-    explicit __attribute__((noinline)) Exception(
+    explicit DJ_NOINLINE Exception(
         const char *name, const char* file, const int line, const std::string& error) {
         message = std::string(name) + " error (" + file + ":" + std::to_string(line) + "): " + error;
-        // use `-g1` compile option to enable line number information in backtrace
+        // Linux: use `-g1` for line numbers. Windows: build with /Zi to get symbols in the trace.
         const auto trace = detail::get_backtrace<2>();
         if (not trace.empty())
             message += "\nC++ trace (most recent call first):\n" + trace;

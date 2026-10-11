@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cerrno>
 #include <filesystem>
 #include <fstream>
@@ -8,8 +9,17 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+
+#ifdef _WIN32
+#include <cwctype>
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
+#include <sys/stat.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <deep_jit/utils/exception.hpp>
 
@@ -20,6 +30,36 @@ inline std::string read(const std::filesystem::path& path) {
     DJ_HOST_ASSERT(input.is_open(), "failed to open for reading: {}", path.string());
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
+
+#ifdef _WIN32
+
+inline void fsync_file(const std::filesystem::path& path) {
+    // Windows cannot open or flush directory handles through the CRT, and NTFS
+    // journals directory metadata itself, so directories are a no-op here.
+    std::error_code dir_error;
+    if (std::filesystem::is_directory(path, dir_error))
+        return;
+
+    // `_commit` (FlushFileBuffers) requires write access, so open write-only
+    // without truncation.
+    int fd = -1;
+    const errno_t open_error = ::_wsopen_s(&fd, path.c_str(), _O_WRONLY | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    if (open_error != 0 or fd < 0) {
+        const std::error_code error(open_error, std::generic_category());
+        DJ_PANIC("failed to open for fsync: {}: {}", path.string(), error.message());
+    }
+    if (::_commit(fd) != 0) {
+        const std::error_code error(errno, std::generic_category());
+        ::_close(fd);
+        DJ_PANIC("failed to fsync: {}: {}", path.string(), error.message());
+    }
+    if (::_close(fd) != 0) {
+        const std::error_code error(errno, std::generic_category());
+        DJ_PANIC("failed to close after fsync: {}: {}", path.string(), error.message());
+    }
+}
+
+#else
 
 inline void fsync_file(const std::filesystem::path& path) {
     const auto fd = ::open(path.c_str(), O_RDONLY);
@@ -37,6 +77,8 @@ inline void fsync_file(const std::filesystem::path& path) {
         DJ_PANIC("failed to close after fsync: {}: {}", path.string(), error.message());
     }
 }
+
+#endif
 
 // Recursively fsync a directory tree, bottom-up: ensures data and directory
 // entries are visible to other processes on distributed filesystems.
@@ -114,7 +156,17 @@ inline std::optional<std::filesystem::path> normalize_path(const std::optional<s
 }
 
 inline bool is_executable(const std::filesystem::path& path) {
+#ifdef _WIN32
+    // Windows has no execute permission bit; executability is decided by extension.
+    if (not std::filesystem::is_regular_file(path))
+        return false;
+    auto extension = path.extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](const wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    return extension == L".exe" or extension == L".com" or extension == L".bat" or extension == L".cmd";
+#else
     return std::filesystem::is_regular_file(path) and ::access(path.c_str(), X_OK) == 0;
+#endif
 }
 
 }  // namespace deep_jit

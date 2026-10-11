@@ -142,17 +142,17 @@ struct CompilerOptions {
         if (not post_hook)
             return "";
 
-        // Check cache hit
-        thread_local std::unordered_map<std::string, std::string> post_hook_hashes;
-        const auto path = config.get_python_path(*post_hook);
-        if (const auto iterator = post_hook_hashes.find(path); iterator != post_hook_hashes.end())
+        // Check cache hit (keyed by the native path string: std::string on POSIX, std::wstring on Windows)
+        thread_local std::unordered_map<std::filesystem::path::string_type, std::string> post_hook_hashes;
+        const std::filesystem::path path = config.get_python_path(*post_hook);
+        if (const auto iterator = post_hook_hashes.find(path.native()); iterator != post_hook_hashes.end())
             return iterator->second;
 
         // Miss: update hash
         const auto digest = hash::FNV1a()
             .update(*post_hook).update(read(path))
             .get_hex_digest();
-        return post_hook_hashes.emplace(path, digest).first->second;
+        return post_hook_hashes.emplace(path.native(), digest).first->second;
     }
 
     [[nodiscard]] json to_json() const {
